@@ -2,6 +2,7 @@ import { useEffect, useImperativeHandle, useRef } from "react";
 import type { HandLandmarkerResult } from "@mediapipe/tasks-vision";
 import { useDrawStore } from "../stores/drawStore";
 import { indexTip, pinchDistance, type Point } from "../utils/landmarks";
+import { Point2DFilter } from "../utils/oneEuro";
 
 // Pinch hysteresis (normalized thumb-index distance). Fingers must come within
 // PINCH_ON to start, and open past PINCH_OFF to release. The gap stops the
@@ -38,7 +39,9 @@ export function DrawCanvas({ videoRef, resultRef, ref }: Props) {
   const displayRef = useRef<HTMLCanvasElement>(null);
   const inkRef = useRef<HTMLCanvasElement>(document.createElement("canvas"));
   const lastPoint = useRef<Point | null>(null);
-  const smoothed = useRef<Point | null>(null);
+  // One-Euro filter on the fingertip, reset whenever the hand is lost
+  const filter = useRef(new Point2DFilter());
+  const hadHand = useRef(false);
   const wasPinching = useRef(false);
   // Color under the picker and the point it samples from, while picking
   const hoverColor = useRef<string | null>(null);
@@ -71,7 +74,6 @@ export function DrawCanvas({ videoRef, resultRef, ref }: Props) {
   const restoreInk = (data: ImageData) => {
     inkRef.current.getContext("2d")?.putImageData(data, 0, 0);
     lastPoint.current = null;
-    smoothed.current = null;
   };
 
   useImperativeHandle(ref, () => ({
@@ -79,7 +81,6 @@ export function DrawCanvas({ videoRef, resultRef, ref }: Props) {
       const ink = inkRef.current;
       ink.getContext("2d")?.clearRect(0, 0, ink.width, ink.height);
       lastPoint.current = null;
-      smoothed.current = null;
       undoStack.current = [];
       redoStack.current = [];
     },
@@ -163,23 +164,16 @@ export function DrawCanvas({ videoRef, resultRef, ref }: Props) {
         const lm = hands[0];
         const tip = indexTip(lm);
         const raw = { x: (1 - tip.x) * w, y: tip.y * h };
-        // Exponential moving average smooths the jittery fingertip. A low
-        // factor weights past frames more, for steadier lines
-        const a = 0.15;
-        if (smoothed.current) {
-          smoothed.current = {
-            x: smoothed.current.x + a * (raw.x - smoothed.current.x),
-            y: smoothed.current.y + a * (raw.y - smoothed.current.y),
-          };
-        } else {
-          smoothed.current = raw;
-        }
-        cursor = smoothed.current;
+        // Start the filter fresh when the hand reappears so the cursor doesn't
+        // ease in from a stale position
+        if (!hadHand.current) filter.current = new Point2DFilter();
+        hadHand.current = true;
+        cursor = filter.current.filter(raw, performance.now() / 1000);
         const d = pinchDistance(lm);
         pinching = wasPinching.current ? d < PINCH_OFF : d < PINCH_ON;
         wasPinching.current = pinching;
       } else {
-        smoothed.current = null;
+        hadHand.current = false;
         wasPinching.current = false;
       }
 
