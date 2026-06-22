@@ -10,7 +10,7 @@ const WASM_URL =
 const MODEL_URL =
   "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
 
-export type TrackerStatus = "loading" | "ready" | "error";
+export type TrackerStatus = "loading" | "idle" | "ready" | "error";
 
 export interface CameraOption {
   deviceId: string;
@@ -26,6 +26,8 @@ interface UseHandTracker {
   cameras: CameraOption[];
   deviceId: string | null;
   selectCamera: (deviceId: string) => void;
+  enabled: boolean;
+  setEnabled: (enabled: boolean) => void;
 }
 
 // Loads the HandLandmarker once, then opens the selected webcam and runs
@@ -39,10 +41,11 @@ export function useHandTracker(): UseHandTracker {
   const [error, setError] = useState<string | null>(null);
   const [cameras, setCameras] = useState<CameraOption[]>([]);
   const [deviceId, setDeviceId] = useState<string | null>(null);
+  const [enabled, setEnabled] = useState(false);
 
-  // Load the model once
+  // Load the model once. The camera stays off until the user enables it
   useEffect(() => {
-    let cancelled = false;
+    let canceled = false;
     (async () => {
       try {
         const fileset = await FilesetResolver.forVisionTasks(WASM_URL);
@@ -51,32 +54,33 @@ export function useHandTracker(): UseHandTracker {
           runningMode: "VIDEO",
           numHands: 1,
         });
-        if (cancelled) {
+        if (canceled) {
           lm.close();
           return;
         }
         landmarkerRef.current = lm;
-        setDeviceId(""); // empty string means "default camera", triggers open
+        setDeviceId(""); // empty string means "default camera"
+        setStatus("idle");
       } catch (err) {
-        if (cancelled) return;
+        if (canceled) return;
         setError(err instanceof Error ? err.message : String(err));
         setStatus("error");
       }
     })();
     return () => {
-      cancelled = true;
+      canceled = true;
       landmarkerRef.current?.close();
       landmarkerRef.current = null;
     };
   }, []);
 
-  // Open the camera and run the detection loop whenever deviceId changes
+  // Open the camera and run the detection loop while enabled
   useEffect(() => {
-    if (deviceId === null || !landmarkerRef.current) return;
+    if (!enabled || deviceId === null || !landmarkerRef.current) return;
     let stream: MediaStream | null = null;
     let rafId = 0;
     let lastVideoTime = -1;
-    let cancelled = false;
+    let canceled = false;
 
     (async () => {
       try {
@@ -87,7 +91,7 @@ export function useHandTracker(): UseHandTracker {
             : { width: 1280, height: 720 },
         });
         const video = videoRef.current;
-        if (!video || cancelled) return;
+        if (!video || canceled) return;
         video.srcObject = stream;
         await video.play();
 
@@ -104,7 +108,7 @@ export function useHandTracker(): UseHandTracker {
         setStatus("ready");
 
         const loop = () => {
-          if (cancelled || !landmarkerRef.current || !videoRef.current) return;
+          if (canceled || !landmarkerRef.current || !videoRef.current) return;
           const v = videoRef.current;
           if (v.currentTime !== lastVideoTime && v.readyState >= 2) {
             lastVideoTime = v.currentTime;
@@ -117,18 +121,20 @@ export function useHandTracker(): UseHandTracker {
         };
         rafId = requestAnimationFrame(loop);
       } catch (err) {
-        if (cancelled) return;
+        if (canceled) return;
         setError(err instanceof Error ? err.message : String(err));
         setStatus("error");
       }
     })();
 
     return () => {
-      cancelled = true;
+      canceled = true;
       cancelAnimationFrame(rafId);
       stream?.getTracks().forEach((track) => track.stop());
+      resultRef.current = null;
+      setStatus("idle");
     };
-  }, [deviceId]);
+  }, [enabled, deviceId]);
 
   return {
     videoRef,
@@ -138,5 +144,7 @@ export function useHandTracker(): UseHandTracker {
     cameras,
     deviceId,
     selectCamera: setDeviceId,
+    enabled,
+    setEnabled,
   };
 }

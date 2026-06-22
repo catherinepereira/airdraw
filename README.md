@@ -13,8 +13,4 @@ Open the printed localhost URL and allow camera access. The hand tracking model 
 
 ## Use
 
-Pinch your thumb and index finger together to draw, open the pinch to move without drawing. The toolbar has color swatches, an eraser and an eyedropper, brush and smoothing sliders, a background toggle (camera/white/black), a reference image loader to trace over, a camera picker, per-stroke undo/redo, clear, and PNG export (with camera, on background, or transparent).
-
-## Stack
-
-React + TypeScript + Vite, Tailwind v4, MediaPipe Tasks hand landmarker. Static build, deployable to any host that serves files over HTTPS (the webcam requires it).
+Pinch your thumb and index finger together to draw, open the pinch to move without drawing. The toolbar has color swatches, an eraser, a color picker (select it, hover the image to preview the color, then pinch to grab it), a brush size slider, a background toggle (camera/white/black), a camera picker, and per-stroke undo/redo and clear. Export PNG opens a preview where you can swap between camera, background, and transparent before downloading.

@@ -3,11 +3,18 @@ import type { HandLandmarkerResult } from "@mediapipe/tasks-vision";
 import { useDrawStore } from "../stores/drawStore";
 import { indexTip, pinchDistance, type Point } from "../utils/landmarks";
 
-// Pinch closer than this (normalized thumb-index distance) starts drawing
-const PINCH_THRESHOLD = 0.06;
+// Pinch hysteresis (normalized thumb-index distance). Fingers must come within
+// PINCH_ON to start, and open past PINCH_OFF to release. The gap stops the
+// pinch from chattering at a single boundary
+const PINCH_ON = 0.045;
+const PINCH_OFF = 0.075;
 
 // Snapshots beyond this are dropped so the undo stack can't grow without bound
 const MAX_UNDO = 30;
+
+// The color picker samples this far above the fingertip so the finger itself
+// does not block the color being read
+const PICK_OFFSET_Y = 44;
 
 export type SaveMode = "camera" | "background" | "transparent";
 
@@ -15,7 +22,6 @@ export interface DrawCanvasHandle {
   clear: () => void;
   undo: () => void;
   redo: () => void;
-  setReference: (img: HTMLImageElement | null) => void;
   toPNG: (mode: SaveMode) => string;
 }
 
@@ -28,12 +34,15 @@ interface Props {
 const BG_FILL: Record<string, string> = { white: "#ffffff", black: "#1a1c23" };
 
 export function DrawCanvas({ videoRef, resultRef, ref }: Props) {
-  // Visible canvas shows background + reference + ink + cursor, ink layer persists
+  // Visible canvas shows background + ink + cursor, ink layer persists
   const displayRef = useRef<HTMLCanvasElement>(null);
   const inkRef = useRef<HTMLCanvasElement>(document.createElement("canvas"));
-  const referenceRef = useRef<HTMLImageElement | null>(null);
   const lastPoint = useRef<Point | null>(null);
   const smoothed = useRef<Point | null>(null);
+  const wasPinching = useRef(false);
+  // Color under the picker and the point it samples from, while picking
+  const hoverColor = useRef<string | null>(null);
+  const pickPoint = useRef<Point | null>(null);
   // ImageData per stroke. undo moves the current state onto redo and vice versa
   const undoStack = useRef<ImageData[]>([]);
   const redoStack = useRef<ImageData[]>([]);
@@ -43,7 +52,6 @@ export function DrawCanvas({ videoRef, resultRef, ref }: Props) {
   const sizeRef = useRef(useDrawStore.getState().brushSize);
   const toolRef = useRef(useDrawStore.getState().tool);
   const bgRef = useRef(useDrawStore.getState().background);
-  const smoothRef = useRef(useDrawStore.getState().smoothing);
   useEffect(
     () =>
       useDrawStore.subscribe((s) => {
@@ -51,7 +59,6 @@ export function DrawCanvas({ videoRef, resultRef, ref }: Props) {
         sizeRef.current = s.brushSize;
         toolRef.current = s.tool;
         bgRef.current = s.background;
-        smoothRef.current = s.smoothing;
       }),
     [],
   );
@@ -88,9 +95,6 @@ export function DrawCanvas({ videoRef, resultRef, ref }: Props) {
       undoStack.current.push(snapshotInk());
       restoreInk(next);
     },
-    setReference(img) {
-      referenceRef.current = img;
-    },
     toPNG(mode) {
       const ink = inkRef.current;
       const out = document.createElement("canvas");
@@ -114,7 +118,7 @@ export function DrawCanvas({ videoRef, resultRef, ref }: Props) {
 
   useEffect(() => {
     let rafId = 0;
-    let cancelled = false;
+    let canceled = false;
 
     const sizeToVideo = () => {
       const video = videoRef.current;
@@ -130,7 +134,7 @@ export function DrawCanvas({ videoRef, resultRef, ref }: Props) {
     };
 
     const render = () => {
-      if (cancelled) return;
+      if (canceled) return;
       rafId = requestAnimationFrame(render);
       const video = videoRef.current;
       const display = displayRef.current;
@@ -152,14 +156,6 @@ export function DrawCanvas({ videoRef, resultRef, ref }: Props) {
         ctx.fillRect(0, 0, w, h);
       }
 
-      // Reference image drawn faintly to trace over
-      if (referenceRef.current) {
-        ctx.save();
-        ctx.globalAlpha = 0.4;
-        ctx.drawImage(referenceRef.current, 0, 0, w, h);
-        ctx.restore();
-      }
-
       const hands = resultRef.current?.landmarks;
       let cursor: Point | null = null;
       let pinching = false;
@@ -167,8 +163,9 @@ export function DrawCanvas({ videoRef, resultRef, ref }: Props) {
         const lm = hands[0];
         const tip = indexTip(lm);
         const raw = { x: (1 - tip.x) * w, y: tip.y * h };
-        // Exponential moving average smooths the jittery fingertip
-        const a = 1 - smoothRef.current * 0.85;
+        // Exponential moving average smooths the jittery fingertip. A low
+        // factor weights past frames more, for steadier lines
+        const a = 0.15;
         if (smoothed.current) {
           smoothed.current = {
             x: smoothed.current.x + a * (raw.x - smoothed.current.x),
@@ -178,22 +175,37 @@ export function DrawCanvas({ videoRef, resultRef, ref }: Props) {
           smoothed.current = raw;
         }
         cursor = smoothed.current;
-        pinching = pinchDistance(lm) < PINCH_THRESHOLD;
+        const d = pinchDistance(lm);
+        pinching = wasPinching.current ? d < PINCH_OFF : d < PINCH_ON;
+        wasPinching.current = pinching;
       } else {
         smoothed.current = null;
+        wasPinching.current = false;
       }
 
       const tool = toolRef.current;
 
-      if (cursor && pinching && tool === "eyedropper") {
-        // Sample the pixel under the cursor (background + reference + ink)
-        const px = ctx.getImageData(cursor.x, cursor.y, 1, 1).data;
-        const hex =
-          "#" +
-          [px[0], px[1], px[2]]
-            .map((c) => c.toString(16).padStart(2, "0"))
-            .join("");
-        useDrawStore.getState().setColor(hex); // also switches tool to draw
+      if (tool === "eyedropper") {
+        // Track the color every frame, commit it on pinch. Sample above the
+        // fingertip so the finger does not cover the color being read
+        if (cursor) {
+          const sx = cursor.x;
+          const sy = Math.max(0, cursor.y - PICK_OFFSET_Y);
+          const px = ctx.getImageData(sx, sy, 1, 1).data;
+          hoverColor.current =
+            "#" +
+            [px[0], px[1], px[2]]
+              .map((c) => c.toString(16).padStart(2, "0"))
+              .join("");
+          pickPoint.current = { x: sx, y: sy };
+          if (pinching) {
+            useDrawStore.getState().setColor(hoverColor.current); // switches to draw
+          }
+        } else {
+          hoverColor.current = null;
+          pickPoint.current = null;
+        }
+        lastPoint.current = null;
       } else if (cursor && pinching) {
         const ink = inkRef.current.getContext("2d")!;
         const erasing = tool === "erase";
@@ -227,6 +239,11 @@ export function DrawCanvas({ videoRef, resultRef, ref }: Props) {
 
       ctx.drawImage(inkRef.current, 0, 0);
 
+      if (tool !== "eyedropper") {
+        hoverColor.current = null;
+        pickPoint.current = null;
+      }
+
       if (cursor) {
         ctx.beginPath();
         ctx.arc(cursor.x, cursor.y, sizeRef.current / 2 + 4, 0, Math.PI * 2);
@@ -244,11 +261,35 @@ export function DrawCanvas({ videoRef, resultRef, ref }: Props) {
         ctx.stroke();
         ctx.setLineDash([]);
       }
+
+      // Marker at the point the picker reads, with a line back to the fingertip
+      if (pickPoint.current && cursor) {
+        ctx.strokeStyle = "#0ea5e9";
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(cursor.x, cursor.y);
+        ctx.lineTo(pickPoint.current.x, pickPoint.current.y);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.arc(pickPoint.current.x, pickPoint.current.y, 6, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+
+      // Live swatch of the hovered color while picking
+      if (hoverColor.current) {
+        const s = 56;
+        const pad = 16;
+        ctx.fillStyle = hoverColor.current;
+        ctx.fillRect(w - s - pad, pad, s, s);
+        ctx.strokeStyle = "#ffffff";
+        ctx.lineWidth = 3;
+        ctx.strokeRect(w - s - pad, pad, s, s);
+      }
     };
 
     rafId = requestAnimationFrame(render);
     return () => {
-      cancelled = true;
+      canceled = true;
       cancelAnimationFrame(rafId);
     };
   }, [videoRef, resultRef]);
