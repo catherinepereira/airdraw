@@ -1,4 +1,7 @@
-# airdraw
+# 🖍️ airdraw
+
+<img width="3200" height="2236" alt="airdraw" src="https://github.com/user-attachments/assets/4f5ce3f7-2d91-4a17-9aca-62b816d37a23" />
+
 
 Draw on screen by pinching your fingers in the air. Your webcam tracks your hand with MediaPipe and pinching thumb to index finger allows you to draw. Runs entirely in the browser, no backend.
 
